@@ -1,4 +1,7 @@
 /target
+.claude
+CLAUDE.md
+
 # Logs
 logs
 *.log
