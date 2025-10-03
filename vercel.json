@@ -1,4 +1,5 @@
 {
   "buildCommand": "yarn build",
-  "outputDirectory": "dist"
+  "outputDirectory": "dist",
+  "public": true
 }
