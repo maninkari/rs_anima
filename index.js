@@ -36,7 +36,7 @@ speedSlider.type = "range";
 speedSlider.min = "-0.5";
 speedSlider.max = "0.5";
 speedSlider.step = "0.01";
-speedSlider.value = "0.1";
+speedSlider.value = "0.01";
 speedSlider.addEventListener("input", (e) => {
   wasm.set_speed(parseFloat(e.target.value));
 });
@@ -116,17 +116,26 @@ document.body.appendChild(container);
 
 // Initialize
 (async () => {
-  await init(mirrorwasm);
+  try {
+    await init(mirrorwasm);
+    console.log("WASM initialized successfully");
 
-  wasm.start_simple_tunnel(
-    "canvas",
-    A,
-    B,
-    R,
-    polygon_radius,
-    polygon_sides,
-    num_polygons
-  );
+    const result = wasm.start_simple_tunnel(
+      "canvas",
+      A,
+      B,
+      R,
+      polygon_radius,
+      polygon_sides,
+      num_polygons
+    );
+    console.log("Tunnel started:", result);
+  } catch (error) {
+    console.error("Error initializing tunnel:", error);
+    document.body.innerHTML += `<div style="color: red; padding: 20px;">Error: ${
+      error.message || error
+    }</div>`;
+  }
 
   // Add keyboard controls
   let currentSpeed = 0.1; // Track current speed
