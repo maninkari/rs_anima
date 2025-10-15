@@ -9,6 +9,20 @@ pub struct Lissajou3D {
     r: f64,
 }
 
+#[derive(Clone, Copy)]
+pub struct Vertex {
+    pub pos: [f32; 3],
+    pub color: [f32; 4],
+    // pub uv: [f32; 2],
+}
+
+pub struct Mesh {
+    pub vertices: Vec<Vertex>,
+    pub triangles: Vec<u32>,
+    pub long_lines: Vec<u32>,
+    pub lat_lines: Vec<u32>,
+}
+
 #[wasm_bindgen]
 impl Lissajou3D {
     #[wasm_bindgen(constructor)]
@@ -53,11 +67,25 @@ impl Lissajou3D {
         .normalize()
     }
 
-    // Normal (normalized)
+    // Normal (radial frame - points outward from origin)
+    // This creates a twist-free frame suitable for visualization
     pub fn d2(&self, t: f64) -> V3D {
         let p = self.position(t);
         let d1 = self.d1(t);
-        p.cross(&d1).normalize()
+
+        // Use radial direction from origin, make it orthogonal to tangent
+        let radial = p.normalize();
+        let tangent = d1;
+
+        // Project radial onto plane perpendicular to tangent
+        let dot = radial.dot(&tangent);
+        let projection = V3D::new(
+            radial.x - dot * tangent.x,
+            radial.y - dot * tangent.y,
+            radial.z - dot * tangent.z,
+        );
+
+        projection.normalize()
     }
 
     // Binormal
@@ -82,123 +110,92 @@ impl Lissajou3D {
         ]
     }
 
-    // Generate vertex buffer: [longitude_lines, latitude_lines, tunnel_triangles]
-    pub fn generate_tunnel_vertices(
+    pub fn generate_tunnel_mesh(
         &self,
         polygon_radius: f64,
         polygon_sides: usize,
         num_polygons: usize,
-        show_longitude: bool,
-        show_latitude: bool,
-        show_tunnel: bool,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> Mesh {
         let polygon = Polygon3D::new(polygon_radius, polygon_sides);
-        let mut longitude_verts = Vec::new();
-        let mut latitude_verts = Vec::new();
-        let mut tunnel_verts = Vec::new();
-
-        // Generate polygons along curve
+        let rings = num_polygons + 1;
         let mut all_polygons = Vec::new();
-        let total = num_polygons + 1; // Extra polygon to close loop
-        for i in 0..total {
+
+        for i in 0..rings {
             let t = 2.0 * std::f64::consts::PI * (i as f64) / (num_polygons as f64);
             let matrix = self.transform_matrix(t);
-            let transformed = polygon.transform(&matrix);
-            all_polygons.push(transformed);
+            all_polygons.push(polygon.transform(&matrix));
         }
 
-        // Generate longitude lines (along curve direction)
-        if show_longitude {
-            for vertex_idx in 0..polygon_sides {
-                for poly_idx in 0..(num_polygons) {
-                    let v0 = &all_polygons[poly_idx][vertex_idx];
-                    let v1 = &all_polygons[poly_idx + 1][vertex_idx];
+        // Create vertices for all rings including the closing ring
+        let mut vertices = Vec::with_capacity(rings * polygon_sides);
 
-                    longitude_verts.extend([v0.x as f32, v0.y as f32, v0.z as f32]);
-                    longitude_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-                }
+        // Pre-compute the first ring's color to reuse for the last ring
+        let first_rgb = hsv_to_rgb(0.0, 1.0, 1.0);
+
+        for i in 0..rings {
+            // Generate color based on position along curve
+            // The last ring must use the exact same color as the first ring
+            let rgb = if i == num_polygons {
+                first_rgb // Reuse first color for perfect loop closure
+            } else {
+                let delta = (i as f32 / num_polygons as f32) * 2.0 * std::f64::consts::PI as f32;
+                (
+                    0.5 + 0.5 * delta.sin(),
+                    0.35 + 0.35 * (3.0 * delta).cos(),
+                    0.75 + 0.25 * (4.0 * delta).sin(),
+                )
+            };
+
+            for j in 0..polygon_sides {
+                let p = &all_polygons[i][j];
+                vertices.push(Vertex {
+                    pos: [p.x as f32, p.y as f32, p.z as f32],
+                    color: [rgb.0, rgb.1, rgb.2, 0.5], // More opaque, less washed out
+                });
             }
         }
 
-        // Generate latitude lines (around each polygon)
-        if show_latitude {
-            for poly_idx in 0..num_polygons {
-                let poly = &all_polygons[poly_idx];
-                for vertex_idx in 0..polygon_sides {
-                    let v0 = &poly[vertex_idx];
-                    let v1 = &poly[(vertex_idx + 1) % polygon_sides];
+        // Triangles - connect each ring to the next (last ring connects to ring 0)
+        let mut triangles = Vec::new();
+        for i in 0..num_polygons {
+            for j in 0..polygon_sides {
+                let next_side = (j + 1) % polygon_sides;
 
-                    latitude_verts.extend([v0.x as f32, v0.y as f32, v0.z as f32]);
-                    latitude_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-                }
+                let a = (i * polygon_sides + j) as u32;
+                let b = ((i + 1) * polygon_sides + j) as u32;
+                let c = (i * polygon_sides + next_side) as u32;
+                let d = ((i + 1) * polygon_sides + next_side) as u32;
+                triangles.extend_from_slice(&[a, b, c, b, d, c]);
             }
         }
 
-        // Generate tunnel triangles
-        if show_tunnel {
-            for poly_idx in 0..num_polygons {
-                for vertex_idx in 0..polygon_sides {
-                    let next_vertex = (vertex_idx + 1) % polygon_sides;
-
-                    let v0 = &all_polygons[poly_idx][vertex_idx];
-                    let v1 = &all_polygons[poly_idx + 1][vertex_idx];
-                    let v2 = &all_polygons[poly_idx][next_vertex];
-                    let v3 = &all_polygons[poly_idx + 1][next_vertex];
-
-                    // Calculate quad center and curve position to determine outward direction
-                    let t_current = 2.0 * std::f64::consts::PI * (poly_idx as f64)
-                        / ((all_polygons.len() - 1) as f64);
-                    let curve_center = self.position(t_current);
-
-                    let quad_center = V3D::new(
-                        (v0.x + v1.x + v2.x + v3.x) / 4.0,
-                        (v0.y + v1.y + v2.y + v3.y) / 4.0,
-                        (v0.z + v1.z + v2.z + v3.z) / 4.0,
-                    );
-
-                    // Vector from curve center to quad center (outward direction)
-                    let outward = V3D::new(
-                        quad_center.x - curve_center.x,
-                        quad_center.y - curve_center.y,
-                        quad_center.z - curve_center.z,
-                    );
-
-                    // Calculate normal for triangle v0, v1, v2
-                    let edge1 = V3D::new(v1.x - v0.x, v1.y - v0.y, v1.z - v0.z);
-                    let edge2 = V3D::new(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
-                    let normal = edge1.cross(&edge2);
-
-                    // Check if normal points outward (positive dot product)
-                    let faces_outward = normal.dot(&outward) > 0.0;
-
-                    if faces_outward {
-                        // Normal already points outward, use counter-clockwise winding
-                        // Triangle 1: v0, v1, v2
-                        tunnel_verts.extend([v0.x as f32, v0.y as f32, v0.z as f32]);
-                        tunnel_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-                        tunnel_verts.extend([v2.x as f32, v2.y as f32, v2.z as f32]);
-
-                        // Triangle 2: v1, v3, v2
-                        tunnel_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-                        tunnel_verts.extend([v3.x as f32, v3.y as f32, v3.z as f32]);
-                        tunnel_verts.extend([v2.x as f32, v2.y as f32, v2.z as f32]);
-                    } else {
-                        // Normal points inward, reverse winding to make it point outward
-                        // Triangle 1: v0, v2, v1 (reversed)
-                        tunnel_verts.extend([v0.x as f32, v0.y as f32, v0.z as f32]);
-                        tunnel_verts.extend([v2.x as f32, v2.y as f32, v2.z as f32]);
-                        tunnel_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-
-                        // Triangle 2: v1, v2, v3 (reversed)
-                        tunnel_verts.extend([v1.x as f32, v1.y as f32, v1.z as f32]);
-                        tunnel_verts.extend([v2.x as f32, v2.y as f32, v2.z as f32]);
-                        tunnel_verts.extend([v3.x as f32, v3.y as f32, v3.z as f32]);
-                    }
-                }
+        // Longitude lines - along the curve
+        let mut long_lines = Vec::new();
+        for j in 0..polygon_sides {
+            for i in 0..num_polygons {
+                let a = (i * polygon_sides + j) as u32;
+                let b = ((i + 1) * polygon_sides + j) as u32;
+                long_lines.extend_from_slice(&[a, b]);
             }
         }
 
-        (longitude_verts, latitude_verts, tunnel_verts)
+        // Latitude lines - around each ring
+        let mut lat_lines = Vec::new();
+        for i in 0..rings {
+            for j in 0..polygon_sides {
+                let next_side = (j + 1) % polygon_sides;
+                let a = (i * polygon_sides + j) as u32;
+                let b = (i * polygon_sides + next_side) as u32;
+                lat_lines.extend_from_slice(&[a, b]);
+            }
+        }
+
+        Mesh {
+            vertices,
+            triangles,
+            long_lines,
+            lat_lines,
+        }
     }
 }
 
