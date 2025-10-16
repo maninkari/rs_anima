@@ -13,7 +13,7 @@ mod polygon;
 use lisa::Lissajou3D;
 
 // Simple global state
-static SPEED: Mutex<f32> = Mutex::new(0.1);
+static SPEED: Mutex<f32> = Mutex::new(0.02);
 static TIME: Mutex<f32> = Mutex::new(0.0);
 static SHOW_LONGITUDE: Mutex<bool> = Mutex::new(true);
 static SHOW_LATITUDE: Mutex<bool> = Mutex::new(true);
@@ -186,6 +186,12 @@ pub fn start_simple_tunnel(
     let canvas: HtmlCanvasElement = document.get_element_by_id(canvas_id).unwrap().dyn_into()?;
     let gl: GL = canvas.get_context("webgl")?.unwrap().dyn_into()?;
 
+    // Enable OES_element_index_uint extension for 32-bit indices
+    let _ = gl.get_extension("OES_element_index_uint").map_err(|e| {
+        web_sys::console::error_1(&format!("Failed to get extension: {:?}", e).into());
+        e
+    })?;
+
     gl.enable(GL::DEPTH_TEST);
     gl.enable(GL::BLEND);
     gl.blend_func(GL::SRC_ALPHA, GL::ONE_MINUS_SRC_ALPHA);
@@ -194,16 +200,20 @@ pub fn start_simple_tunnel(
     gl.disable(GL::CULL_FACE);
     // gl.cull_face(GL::BACK);
 
-    // Simple shaders
+    // Updated shaders with per-vertex color and alpha override
     let vert_code = r#"
         attribute vec3 position;
+        attribute vec4 color;
         uniform mat4 u_projection;
         uniform mat4 u_view;
         uniform vec4 u_color;
+        uniform float u_use_vertex_color;
+        uniform float u_alpha_override;
         varying vec4 v_color;
         void main() {
             gl_Position = u_projection * u_view * vec4(position, 1.0);
-            v_color = u_color;
+            vec4 base_color = mix(u_color, color, u_use_vertex_color);
+            v_color = vec4(base_color.rgb, base_color.a * u_alpha_override);
         }
     "#;
 
@@ -223,45 +233,64 @@ pub fn start_simple_tunnel(
     // Store initial parameters
     *NUM_POLYGONS.lock().unwrap() = num_polygons;
 
-    // Create Lissajou - vertex generation will be dynamic
+    // Create Lissajou - mesh generation will be dynamic
     let lisa = Lissajou3D::new(a, b, r);
 
-    // Create buffers and initialize with data
-    let (longitude_verts, latitude_verts, tunnel_verts) = lisa.generate_tunnel_vertices(
-        polygon_radius,
-        polygon_sides,
-        num_polygons,
-        true,
-        true,
-        true,
-    );
+    // Generate initial mesh
+    let mesh = lisa.generate_tunnel_mesh(polygon_radius, polygon_sides, num_polygons);
 
-    let longitude_buffer = gl.create_buffer().unwrap();
-    gl.bind_buffer(GL::ARRAY_BUFFER, Some(&longitude_buffer));
+    // Flatten vertex data into interleaved format: [pos.x, pos.y, pos.z, color.r, color.g, color.b, color.a]
+    let vertex_data: Vec<f32> = mesh
+        .vertices
+        .iter()
+        .flat_map(|v| {
+            vec![
+                v.pos[0], v.pos[1], v.pos[2], v.color[0], v.color[1], v.color[2], v.color[3],
+            ]
+        })
+        .collect();
+
+    // Create vertex buffer with interleaved data
+    let vertex_buffer = gl.create_buffer().unwrap();
+    gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vertex_buffer));
     unsafe {
-        let array = js_sys::Float32Array::view(&longitude_verts);
+        let array = js_sys::Float32Array::view(&vertex_data);
         gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
     }
 
-    let latitude_buffer = gl.create_buffer().unwrap();
-    gl.bind_buffer(GL::ARRAY_BUFFER, Some(&latitude_buffer));
+    // Create element buffers for triangles and lines
+    let tri_buffer = gl.create_buffer().unwrap();
+    gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&tri_buffer));
     unsafe {
-        let array = js_sys::Float32Array::view(&latitude_verts);
-        gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
+        let array = js_sys::Uint32Array::view(&mesh.triangles);
+        gl.buffer_data_with_array_buffer_view(GL::ELEMENT_ARRAY_BUFFER, &array, GL::STATIC_DRAW);
     }
 
-    let tunnel_buffer = gl.create_buffer().unwrap();
-    gl.bind_buffer(GL::ARRAY_BUFFER, Some(&tunnel_buffer));
+    let long_buffer = gl.create_buffer().unwrap();
+    gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&long_buffer));
     unsafe {
-        let array = js_sys::Float32Array::view(&tunnel_verts);
-        gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
+        let array = js_sys::Uint32Array::view(&mesh.long_lines);
+        gl.buffer_data_with_array_buffer_view(GL::ELEMENT_ARRAY_BUFFER, &array, GL::STATIC_DRAW);
+    }
+
+    let lat_buffer = gl.create_buffer().unwrap();
+    gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&lat_buffer));
+    unsafe {
+        let array = js_sys::Uint32Array::view(&mesh.lat_lines);
+        gl.buffer_data_with_array_buffer_view(GL::ELEMENT_ARRAY_BUFFER, &array, GL::STATIC_DRAW);
     }
 
     // Get attribute/uniform locations
     let pos_attrib = gl.get_attrib_location(&program, "position") as u32;
+    let color_attrib = gl.get_attrib_location(&program, "color") as u32;
     let projection_uniform = gl.get_uniform_location(&program, "u_projection").unwrap();
     let view_uniform = gl.get_uniform_location(&program, "u_view").unwrap();
-    let color_uniform = gl.get_uniform_location(&program, "u_color").unwrap();
+    let use_vertex_color_uniform = gl
+        .get_uniform_location(&program, "u_use_vertex_color")
+        .unwrap();
+    let alpha_override_uniform = gl
+        .get_uniform_location(&program, "u_alpha_override")
+        .unwrap();
 
     // Setup projection
     let aspect = canvas.width() as f32 / canvas.height() as f32;
@@ -270,58 +299,96 @@ pub fn start_simple_tunnel(
 
     let gl = Rc::new(gl);
 
-    // Track previous polygon count and initial vertex counts for dynamic updates
+    // Track previous polygon count and mesh element counts for dynamic updates
     let mut last_polygon_count = num_polygons;
-    let mut cached_longitude_count = longitude_verts.len() / 3;
-    let mut cached_latitude_count = latitude_verts.len() / 3;
-    let mut cached_tunnel_count = tunnel_verts.len() / 3;
+    let mut cached_tri_count = mesh.triangles.len();
+    let mut cached_long_count = mesh.long_lines.len();
+    let mut cached_lat_count = mesh.lat_lines.len();
+
+    // Track time for proper delta calculation
+    let last_timestamp = Rc::new(RefCell::new(0.0_f64));
 
     // Animation loop
-    let f = Rc::new(RefCell::new(None::<Closure<dyn FnMut()>>));
+    let f = Rc::new(RefCell::new(None::<Closure<dyn FnMut(f64)>>));
     let g = f.clone();
 
-    *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+    let last_timestamp_clone = last_timestamp.clone();
+    *g.borrow_mut() = Some(Closure::wrap(Box::new(move |timestamp: f64| {
+        // Calculate delta time in seconds
+        let last_ts = *last_timestamp_clone.borrow();
+        let delta_time = if last_ts == 0.0 {
+            0.016 // First frame fallback
+        } else {
+            (timestamp - last_ts) / 1000.0 // Convert ms to seconds
+        };
+        *last_timestamp_clone.borrow_mut() = timestamp;
+
         // Update time
         let speed = *SPEED.lock().unwrap();
         let mut time = TIME.lock().unwrap();
-        *time += speed * 0.016; // ~60fps
+        *time += speed * delta_time as f32;
         let t = *time as f64;
 
         // Check if polygon count changed
         let current_polygon_count = *NUM_POLYGONS.lock().unwrap();
 
         if current_polygon_count != last_polygon_count {
-            // Regenerate vertices
-            let (longitude_verts, latitude_verts, tunnel_verts) = lisa.generate_tunnel_vertices(
-                polygon_radius,
-                polygon_sides,
-                current_polygon_count,
-                true,
-                true,
-                true,
-            );
+            // Regenerate mesh
+            let mesh =
+                lisa.generate_tunnel_mesh(polygon_radius, polygon_sides, current_polygon_count);
 
-            // Update buffers
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&longitude_buffer));
+            // Flatten vertex data
+            let vertex_data: Vec<f32> = mesh
+                .vertices
+                .iter()
+                .flat_map(|v| {
+                    vec![
+                        v.pos[0], v.pos[1], v.pos[2], v.color[0], v.color[1], v.color[2],
+                        v.color[3],
+                    ]
+                })
+                .collect();
+
+            // Update vertex buffer
+            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vertex_buffer));
             unsafe {
-                let array = js_sys::Float32Array::view(&longitude_verts);
+                let array = js_sys::Float32Array::view(&vertex_data);
                 gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
             }
-            cached_longitude_count = longitude_verts.len() / 3;
 
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&latitude_buffer));
+            // Update element buffers
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&tri_buffer));
             unsafe {
-                let array = js_sys::Float32Array::view(&latitude_verts);
-                gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
+                let array = js_sys::Uint32Array::view(&mesh.triangles);
+                gl.buffer_data_with_array_buffer_view(
+                    GL::ELEMENT_ARRAY_BUFFER,
+                    &array,
+                    GL::STATIC_DRAW,
+                );
             }
-            cached_latitude_count = latitude_verts.len() / 3;
+            cached_tri_count = mesh.triangles.len();
 
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&tunnel_buffer));
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&long_buffer));
             unsafe {
-                let array = js_sys::Float32Array::view(&tunnel_verts);
-                gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &array, GL::STATIC_DRAW);
+                let array = js_sys::Uint32Array::view(&mesh.long_lines);
+                gl.buffer_data_with_array_buffer_view(
+                    GL::ELEMENT_ARRAY_BUFFER,
+                    &array,
+                    GL::STATIC_DRAW,
+                );
             }
-            cached_tunnel_count = tunnel_verts.len() / 3;
+            cached_long_count = mesh.long_lines.len();
+
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&lat_buffer));
+            unsafe {
+                let array = js_sys::Uint32Array::view(&mesh.lat_lines);
+                gl.buffer_data_with_array_buffer_view(
+                    GL::ELEMENT_ARRAY_BUFFER,
+                    &array,
+                    GL::STATIC_DRAW,
+                );
+            }
+            cached_lat_count = mesh.lat_lines.len();
 
             last_polygon_count = current_polygon_count;
         }
@@ -360,44 +427,51 @@ pub fn start_simple_tunnel(
         };
 
         gl.uniform_matrix4fv_with_f32_array(Some(&view_uniform), false, view.as_slice());
+
+        // Setup vertex attributes (interleaved: pos(3) + color(4) = 7 floats, stride = 28 bytes)
+        let stride = 7 * 4; // 7 floats * 4 bytes per float
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vertex_buffer));
         gl.enable_vertex_attrib_array(pos_attrib);
+        gl.vertex_attrib_pointer_with_i32(pos_attrib, 3, GL::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(color_attrib);
+        gl.vertex_attrib_pointer_with_i32(color_attrib, 4, GL::FLOAT, false, stride, 12);
 
-        // Draw longitude (red)
+        // Draw longitude - use vertex colors with alpha=1.0
         if *SHOW_LONGITUDE.lock().unwrap() {
-            gl.uniform4f(Some(&color_uniform), 1.0, 0.3, 0.3, 0.8);
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&longitude_buffer));
-            gl.vertex_attrib_pointer_with_i32(pos_attrib, 3, GL::FLOAT, false, 0, 0);
+            gl.uniform1f(Some(&use_vertex_color_uniform), 1.0); // Use vertex colors
+            gl.uniform1f(Some(&alpha_override_uniform), 1.0); // Full opacity for lines
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&long_buffer));
             gl.depth_mask(false);
-            gl.draw_arrays(GL::LINES, 0, cached_longitude_count as i32);
+            gl.draw_elements_with_i32(GL::LINES, cached_long_count as i32, GL::UNSIGNED_INT, 0);
             gl.depth_mask(true);
         }
 
-        // Draw latitude (green)
+        // Draw latitude - use vertex colors with alpha=1.0
         if *SHOW_LATITUDE.lock().unwrap() {
-            gl.uniform4f(Some(&color_uniform), 0.3, 1.0, 0.3, 0.8);
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&latitude_buffer));
-            gl.vertex_attrib_pointer_with_i32(pos_attrib, 3, GL::FLOAT, false, 0, 0);
+            gl.uniform1f(Some(&use_vertex_color_uniform), 1.0); // Use vertex colors
+            gl.uniform1f(Some(&alpha_override_uniform), 1.0); // Full opacity for lines
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&lat_buffer));
             gl.depth_mask(false);
-            gl.draw_arrays(GL::LINES, 0, cached_latitude_count as i32);
+            gl.draw_elements_with_i32(GL::LINES, cached_lat_count as i32, GL::UNSIGNED_INT, 0);
             gl.depth_mask(true);
         }
 
-        // Draw tunnel (blue, transparent)
+        // Draw tunnel with per-vertex colors and alpha=0.3
         if *SHOW_TUNNEL.lock().unwrap() {
-            gl.uniform4f(Some(&color_uniform), 0.3, 0.3, 1.0, 0.3);
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&tunnel_buffer));
-            gl.vertex_attrib_pointer_with_i32(pos_attrib, 3, GL::FLOAT, false, 0, 0);
+            gl.uniform1f(Some(&use_vertex_color_uniform), 1.0); // Use vertex colors
+            gl.uniform1f(Some(&alpha_override_uniform), 0.05); // More transparent for tunnel walls
+            gl.bind_buffer(GL::ELEMENT_ARRAY_BUFFER, Some(&tri_buffer));
 
             gl.enable(GL::CULL_FACE);
             gl.depth_mask(false); // transparent: test depth but don't write
 
             // Pass 1: back faces first (cull front)
             gl.cull_face(GL::FRONT);
-            gl.draw_arrays(GL::TRIANGLES, 0, cached_tunnel_count as i32);
+            gl.draw_elements_with_i32(GL::TRIANGLES, cached_tri_count as i32, GL::UNSIGNED_INT, 0);
 
             // Pass 2: front faces
             gl.cull_face(GL::BACK);
-            gl.draw_arrays(GL::TRIANGLES, 0, cached_tunnel_count as i32);
+            gl.draw_elements_with_i32(GL::TRIANGLES, cached_tri_count as i32, GL::UNSIGNED_INT, 0);
 
             gl.depth_mask(true); // restore
             gl.disable(GL::CULL_FACE); // optional restore
@@ -407,7 +481,7 @@ pub fn start_simple_tunnel(
             .unwrap()
             .request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref())
             .unwrap();
-    }) as Box<dyn FnMut()>));
+    }) as Box<dyn FnMut(f64)>));
 
     web_sys::window()
         .unwrap()

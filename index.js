@@ -3,7 +3,7 @@ import mirrorwasm from "./pkg/rust_anima_bg.wasm";
 
 // Lissajous parameters
 const A = 2.0;
-const B = 3.0;
+const B = 7.0;
 const R = 5.0;
 
 // Tunnel parameters
@@ -36,7 +36,7 @@ speedSlider.type = "range";
 speedSlider.min = "-0.5";
 speedSlider.max = "0.5";
 speedSlider.step = "0.01";
-speedSlider.value = "0.1";
+speedSlider.value = "0.01";
 speedSlider.addEventListener("input", (e) => {
   wasm.set_speed(parseFloat(e.target.value));
 });
@@ -116,15 +116,55 @@ document.body.appendChild(container);
 
 // Initialize
 (async () => {
-  await init(mirrorwasm);
+  try {
+    await init(mirrorwasm);
+    console.log("WASM initialized successfully");
 
-  wasm.start_simple_tunnel(
-    "canvas",
-    A,
-    B,
-    R,
-    polygon_radius,
-    polygon_sides,
-    num_polygons
-  );
+    const result = wasm.start_simple_tunnel(
+      "canvas",
+      A,
+      B,
+      R,
+      polygon_radius,
+      polygon_sides,
+      num_polygons
+    );
+    console.log("Tunnel started:", result);
+  } catch (error) {
+    console.error("Error initializing tunnel:", error);
+    document.body.innerHTML += `<div style="color: red; padding: 20px;">Error: ${
+      error.message || error
+    }</div>`;
+  }
+
+  // Add keyboard controls
+  let currentSpeed = 0.1; // Track current speed
+
+  document.addEventListener("keydown", (event) => {
+    switch (event.code) {
+      case "ArrowLeft":
+        // Decrease speed
+        currentSpeed = Math.max(-0.5, currentSpeed - 0.005);
+        wasm.set_speed(currentSpeed);
+        speedSlider.value = currentSpeed.toString();
+        event.preventDefault();
+        break;
+
+      case "ArrowRight":
+        // Increase speed
+        currentSpeed = Math.min(0.5, currentSpeed + 0.005);
+        wasm.set_speed(currentSpeed);
+        speedSlider.value = currentSpeed.toString();
+        event.preventDefault();
+        break;
+
+      case "Space":
+        // Stop/pause (set speed to 0)
+        currentSpeed = 0.0;
+        wasm.set_speed(currentSpeed);
+        speedSlider.value = currentSpeed.toString();
+        event.preventDefault();
+        break;
+    }
+  });
 })();
