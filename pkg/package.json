@@ -1,0 +1,15 @@
+{
+  "name": "rust-anima",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "rust_anima_bg.wasm",
+    "rust_anima.js",
+    "rust_anima.d.ts"
+  ],
+  "main": "rust_anima.js",
+  "types": "rust_anima.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
