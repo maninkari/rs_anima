@@ -198,15 +198,3 @@ impl Lissajou3D {
         }
     }
 }
-
-impl std::ops::Mul<V3D> for f64 {
-    type Output = V3D;
-
-    fn mul(self, rhs: V3D) -> V3D {
-        V3D {
-            x: self * rhs.x,
-            y: self * rhs.y,
-            z: self * rhs.z,
-        }
-    }
-}
