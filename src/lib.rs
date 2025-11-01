@@ -7,6 +7,7 @@ use web_sys::{HtmlCanvasElement, WebGlProgram, WebGlRenderingContext as GL, WebG
 
 extern crate console_error_panic_hook;
 mod lisa;
+mod lisa4;
 mod math;
 mod polygon;
 
